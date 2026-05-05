@@ -1,43 +1,39 @@
 #include <gtk/gtk.h>
-#include "../include/gui.h"
+#include "gui.h"
+#include "pomodoro.h"
 
-static void on_add_clicked(GtkWidget *widget, gpointer data) {
-    g_print("Add Task clicked!\n");
+static void on_button_clicked(GtkWidget *widget, gpointer data) {
+    GtkWidget *label = (GtkWidget *)data;
+    start_pomodoro_timer(label);
 }
 
-static void on_start_clicked(GtkWidget *widget, gpointer data) {
-    g_print("Pomodoro Started!\n");
-}
-
-void start_gui() {
+static void activate(GtkApplication* app, gpointer user_data) {
     GtkWidget *window;
+    GtkWidget *button;
     GtkWidget *box;
-    GtkWidget *title;
-    GtkWidget *add_btn;
-    GtkWidget *start_btn;
 
-    gtk_init(NULL, NULL);
-
-    window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Time Manager");
-    gtk_window_set_default_size(GTK_WINDOW(window), 400, 300);
-
-    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    gtk_window_set_default_size(GTK_WINDOW(window), 300, 200);
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_add(GTK_CONTAINER(window), box);
 
-    title = gtk_label_new("TIME MANAGER");
-    gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 10);
+    GtkWidget *label = gtk_label_new("Quản lý thời gian của bạn");
+    gtk_box_pack_start(GTK_BOX(box), label, TRUE, TRUE, 0);
 
-    add_btn = gtk_button_new_with_label("Add Task");
-    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_clicked), NULL);
-    gtk_box_pack_start(GTK_BOX(box), add_btn, FALSE, FALSE, 5);
-
-    start_btn = gtk_button_new_with_label("Start Pomodoro");
-    g_signal_connect(start_btn, "clicked", G_CALLBACK(on_start_clicked), NULL);
-    gtk_box_pack_start(GTK_BOX(box), start_btn, FALSE, FALSE, 5);
+    button = gtk_button_new_with_label("Bắt đầu Pomodoro");
+    g_signal_connect(button, "clicked", G_CALLBACK(on_button_clicked), label);
+    gtk_box_pack_start(GTK_BOX(box), button, TRUE, TRUE, 0);
 
     gtk_widget_show_all(window);
-    gtk_main();
+}
+
+void start_gui(int argc, char **argv) {
+    GtkApplication *app;
+    int status;
+    app = gtk_application_new("com.sato.timemanager", G_APPLICATION_FLAGS_NONE);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
+    status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_object_unref(app);
 }

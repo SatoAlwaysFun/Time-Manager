@@ -1,6 +1,7 @@
-#include "include/gui.h"
+#include "gui.h"
+#include "pomodoro.h"
 
-int main() {
-    start_gui();
+int main(int argc, char **argv) {
+    start_gui(argc, argv);
     return 0;
 }

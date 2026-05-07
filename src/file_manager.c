@@ -2,6 +2,7 @@
 #include "task_manager.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /*
  * File format (one task per line):
@@ -30,26 +31,34 @@ int fm_load(void) {
     int  loaded = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        /* Strip newline */
         line[strcspn(line, "\r\n")] = '\0';
 
-        int  id, done, prio;
+        char *tok;
+        int id, done, prio;
         char title[MAX_TITLE_LEN];
         char desc[MAX_DESC_LEN];
-        title[0] = desc[0] = '\0';
+        title[0] = '\0';
+        desc[0]  = '\0';
 
-        /* Parse id|done|priority|title|description */
-        char *tok = strtok(line, "|");
-        if (!tok) continue; id   = atoi(tok);
-        tok = strtok(NULL, "|"); if (!tok) continue; done = atoi(tok);
-        tok = strtok(NULL, "|"); if (!tok) continue; prio = atoi(tok);
-        tok = strtok(NULL, "|"); if (tok) strncpy(title, tok, MAX_TITLE_LEN - 1);
-        tok = strtok(NULL, "|"); if (tok) strncpy(desc,  tok, MAX_DESC_LEN  - 1);
+        tok = strtok(line, "|"); if (!tok) continue;
+        id  = atoi(tok);
+
+        tok  = strtok(NULL, "|"); if (!tok) continue;
+        done = atoi(tok);
+
+        tok  = strtok(NULL, "|"); if (!tok) continue;
+        prio = atoi(tok);
+
+        tok = strtok(NULL, "|");
+        if (tok) strncpy(title, tok, MAX_TITLE_LEN - 1);
+
+        tok = strtok(NULL, "|");
+        if (tok) strncpy(desc, tok, MAX_DESC_LEN - 1);
 
         if (task_count < MAX_TASKS) {
             Task *t = &tasks[task_count++];
-            t->id   = id;
-            t->done = done;
+            t->id       = id;
+            t->done     = done;
             t->priority = (Priority)prio;
             strncpy(t->title,       title, MAX_TITLE_LEN - 1);
             strncpy(t->description, desc,  MAX_DESC_LEN  - 1);

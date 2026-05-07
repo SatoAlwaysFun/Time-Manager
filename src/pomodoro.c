@@ -2,7 +2,7 @@
 #include <gtk/gtk.h>
 #include <stdio.h>
 
-#define WORK_SECS        (25 * 60)
+#define WORK_SECS        (45 * 60)
 #define SHORT_BREAK_SECS ( 5 * 60)
 #define LONG_BREAK_SECS  (15 * 60)
 #define CYCLES_BEFORE_LONG 4

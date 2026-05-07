@@ -3,6 +3,10 @@
 
 #include <gtk/gtk.h>
 
-void start_pomodoro_timer(GtkWidget *label);
+void pomodoro_attach(GtkWidget *timer_label,
+                     GtkWidget *btn_start,
+                     GtkWidget *btn_pause,
+                     GtkWidget *btn_reset,
+                     GtkWidget *mode_label);
 
-#endif
+#endif /* POMODORO_H */

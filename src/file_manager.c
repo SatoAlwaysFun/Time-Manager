@@ -6,7 +6,7 @@
 
 /*
  * File format (one task per line):
- *   id|done|priority|title|description\n
+ *   id|done|priority|start_time|title|description\n
  */
 
 int fm_save(void) {
@@ -14,8 +14,9 @@ int fm_save(void) {
     if (!f) return 0;
     for (int i = 0; i < task_count; i++) {
         Task *t = &tasks[i];
-        fprintf(f, "%d|%d|%d|%s|%s\n",
+        fprintf(f, "%d|%d|%d|%lld|%s|%s\n",
                 t->id, t->done, (int)t->priority,
+                (long long)t->start_time,
                 t->title, t->description);
     }
     fclose(f);
@@ -27,7 +28,7 @@ int fm_load(void) {
     if (!f) return 0;
 
     tm_init();
-    char line[512];
+    char line[700];
     int  loaded = 0;
 
     while (fgets(line, sizeof(line), f)) {
@@ -35,6 +36,7 @@ int fm_load(void) {
 
         char *tok;
         int id, done, prio;
+        long long st = 0;
         char title[MAX_TITLE_LEN];
         char desc[MAX_DESC_LEN];
         title[0] = '\0';
@@ -49,6 +51,9 @@ int fm_load(void) {
         tok  = strtok(NULL, "|"); if (!tok) continue;
         prio = atoi(tok);
 
+        tok = strtok(NULL, "|"); if (!tok) continue;
+        st  = atoll(tok);
+
         tok = strtok(NULL, "|");
         if (tok) strncpy(title, tok, MAX_TITLE_LEN - 1);
 
@@ -57,9 +62,10 @@ int fm_load(void) {
 
         if (task_count < MAX_TASKS) {
             Task *t = &tasks[task_count++];
-            t->id       = id;
-            t->done     = done;
-            t->priority = (Priority)prio;
+            t->id         = id;
+            t->done       = done;
+            t->priority   = (Priority)prio;
+            t->start_time = (time_t)st;
             strncpy(t->title,       title, MAX_TITLE_LEN - 1);
             strncpy(t->description, desc,  MAX_DESC_LEN  - 1);
             t->title[MAX_TITLE_LEN - 1]      = '\0';

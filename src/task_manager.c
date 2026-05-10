@@ -12,23 +12,23 @@ void tm_init(void) {
     next_id    = 1;
 }
 
-int tm_add(const char *title, const char *desc, Priority priority) {
+int tm_add(const char *title, const char *desc, Priority priority, time_t start_time) {
     if (task_count >= MAX_TASKS) return -1;
     Task *t = &tasks[task_count++];
     t->id   = next_id++;
     strncpy(t->title,       title ? title : "", MAX_TITLE_LEN - 1);
     strncpy(t->description, desc  ? desc  : "", MAX_DESC_LEN  - 1);
-    t->title[MAX_TITLE_LEN - 1]       = '\0';
-    t->description[MAX_DESC_LEN  - 1] = '\0';
-    t->priority = priority;
-    t->done     = 0;
+    t->title[MAX_TITLE_LEN - 1]      = '\0';
+    t->description[MAX_DESC_LEN - 1] = '\0';
+    t->priority   = priority;
+    t->done       = 0;
+    t->start_time = start_time;
     return t->id;
 }
 
 int tm_delete(int id) {
     for (int i = 0; i < task_count; i++) {
         if (tasks[i].id == id) {
-            /* Shift left */
             for (int j = i; j < task_count - 1; j++)
                 tasks[j] = tasks[j + 1];
             task_count--;

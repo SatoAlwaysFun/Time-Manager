@@ -2,10 +2,31 @@
 #include "pomodoro.h"
 #include "task_manager.h"
 #include "file_manager.h"
+#include "task.h"
 #include <gtk/gtk.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+/* ================================================================
+   Deadline helpers – defined here so gui.c is self-contained
+   ================================================================ */
+static DeadlineStatus dl_status(time_t deadline) {
+    if (deadline == 0) return DEADLINE_NONE;
+    double diff = difftime(deadline, time(NULL));
+    if (diff < 0)         return DEADLINE_OVERDUE;
+    if (diff <= 86400)    return DEADLINE_URGENT;
+    if (diff <= 3*86400)  return DEADLINE_WARNING;
+    return DEADLINE_NORMAL;
+}
+
+static Priority dl_effective_priority(Priority base, DeadlineStatus ds) {
+    if (ds == DEADLINE_OVERDUE || ds == DEADLINE_URGENT)
+        return PRIORITY_HIGH;
+    if (ds == DEADLINE_WARNING && base < PRIORITY_HIGH)
+        return (Priority)(base + 1);
+    return base;
+}
 
 /* ================================================================
    Globals – Task input widgets
@@ -17,9 +38,16 @@ static GtkWidget *combo_priority  = NULL;
 static GtkWidget *spin_hour       = NULL;
 static GtkWidget *spin_minute     = NULL;
 static GtkWidget *cal_widget      = NULL;   /* GtkCalendar */
+static GtkWidget *cal_deadline    = NULL;   /* GtkCalendar for deadline */
+static GtkWidget *chk_deadline    = NULL;   /* toggle whether deadline is set */
+static GtkWidget *deadline_box    = NULL;   /* container to show/hide */
+static GtkWidget *spin_dl_hour    = NULL;   /* deadline hour */
+static GtkWidget *spin_dl_minute  = NULL;   /* deadline minute */
 
 /* Schedule tab */
-static GtkWidget *schedule_grid   = NULL;
+static GtkWidget *schedule_grid      = NULL;
+static GtkWidget *schedule_week_label = NULL;  /* "Tuần DD/MM – DD/MM/YYYY" */
+static time_t     schedule_week_start = 0;      /* Monday 00:00:00 of displayed week */
 
 /* Edit dialog globals */
 static int        edit_task_id    = -1;
@@ -29,6 +57,11 @@ static GtkWidget *edit_combo_priority = NULL;
 static GtkWidget *edit_spin_hour      = NULL;
 static GtkWidget *edit_spin_minute    = NULL;
 static GtkWidget *edit_cal            = NULL;
+static GtkWidget *edit_cal_deadline   = NULL;
+static GtkWidget *edit_chk_deadline   = NULL;
+static GtkWidget *edit_deadline_box   = NULL;
+static GtkWidget *edit_dl_spin_hour   = NULL;   /* deadline hour in edit dialog */
+static GtkWidget *edit_dl_spin_minute = NULL;   /* deadline minute in edit dialog */
 static GtkWidget *edit_dialog         = NULL;
 
 /* Forward declarations */
@@ -46,12 +79,40 @@ static void format_task_time(time_t t, char *buf, size_t len) {
     strftime(buf, len, "%d/%m %H:%M", tm);
 }
 
-/* Compare tasks by priority descending (HIGH > MEDIUM > LOW), then by id */
+/* Format deadline with urgency text */
+static void format_deadline_label(time_t dl, char *buf, size_t len) {
+    if (dl == 0) { buf[0] = '\0'; return; }
+    char date_buf[32];
+    struct tm *tm = localtime(&dl);
+    strftime(date_buf, sizeof(date_buf), "%d/%m/%Y %H:%M", tm);
+
+    DeadlineStatus ds = dl_status(dl);
+    switch (ds) {
+        case DEADLINE_OVERDUE:
+            snprintf(buf, len, "⚠ Quá hạn: %s", date_buf);
+            break;
+        case DEADLINE_URGENT:
+            snprintf(buf, len, "🔥 Gấp! Còn < 1 ngày (%s)", date_buf);
+            break;
+        case DEADLINE_WARNING: {
+            double diff = difftime(dl, time(NULL));
+            int days = (int)(diff / 86400);
+            snprintf(buf, len, "⏰ Còn %d ngày (%s)", days, date_buf);
+            break;
+        }
+        default:
+            snprintf(buf, len, "📅 HH: %s", date_buf);
+            break;
+    }
+}
+
+/* Compare tasks by effective priority (including deadline boost), then id */
 static int compare_tasks_by_priority(const void *a, const void *b) {
     const Task *ta = (const Task *)a;
     const Task *tb = (const Task *)b;
-    if (tb->priority != ta->priority)
-        return (int)tb->priority - (int)ta->priority;
+    Priority eff_a = dl_effective_priority(ta->priority, dl_status(ta->deadline));
+    Priority eff_b = dl_effective_priority(tb->priority, dl_status(tb->deadline));
+    if (eff_b != eff_a) return (int)eff_b - (int)eff_a;
     return ta->id - tb->id;
 }
 
@@ -88,11 +149,33 @@ static void on_edit_save(GtkWidget *btn, gpointer data) {
     tm_val.tm_isdst = -1;
     t->start_time = mktime(&tm_val);
 
+    /* Save deadline */
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(edit_chk_deadline))) {
+        guint dy, dm, dd;
+        gtk_calendar_get_date(GTK_CALENDAR(edit_cal_deadline), &dy, &dm, &dd);
+        struct tm dl_val = {0};
+        dl_val.tm_year  = (int)dy - 1900;
+        dl_val.tm_mon   = (int)dm;
+        dl_val.tm_mday  = (int)dd;
+        dl_val.tm_hour  = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(edit_dl_spin_hour));
+        dl_val.tm_min   = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(edit_dl_spin_minute));
+        dl_val.tm_sec   = 0;
+        dl_val.tm_isdst = -1;
+        t->deadline = mktime(&dl_val);
+    } else {
+        t->deadline = 0;
+    }
+
     fm_save();
     refresh_task_list();
     refresh_schedule();
     gtk_widget_destroy(edit_dialog);
     edit_dialog = NULL;
+}
+
+static void on_deadline_toggle(GtkToggleButton *btn, gpointer data) {
+    GtkWidget *box = GTK_WIDGET(data);
+    gtk_widget_set_sensitive(box, gtk_toggle_button_get_active(btn));
 }
 
 static void on_edit_task(GtkWidget *btn, gpointer data) {
@@ -109,7 +192,7 @@ static void on_edit_task(GtkWidget *btn, gpointer data) {
         GTK_WINDOW(parent),
         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
         NULL);
-    gtk_window_set_default_size(GTK_WINDOW(edit_dialog), 420, 460);
+    gtk_window_set_default_size(GTK_WINDOW(edit_dialog), 440, 700);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(edit_dialog));
     GtkWidget *grid    = gtk_grid_new();
@@ -174,10 +257,58 @@ static void on_edit_task(GtkWidget *btn, gpointer data) {
     gtk_box_pack_start(GTK_BOX(time_box), hms,                FALSE, FALSE, 0);
     gtk_grid_attach(GTK_GRID(grid), time_box, 1, 4, 2, 1);
 
-    /* Save button */
-    GtkWidget *save_btn = gtk_button_new_with_label("💾 Lưu thay đổi");
-    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_edit_save), NULL);
-    gtk_grid_attach(GTK_GRID(grid), save_btn, 0, 5, 4, 1);
+    /* Deadline section */
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_grid_attach(GTK_GRID(grid), sep, 0, 5, 4, 1);
+
+    edit_chk_deadline = gtk_check_button_new_with_label("⏳ Đặt deadline");
+    gtk_grid_attach(GTK_GRID(grid), edit_chk_deadline, 0, 6, 4, 1);
+
+    edit_deadline_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *dl_lbl = gtk_label_new("Ngày deadline:");
+    gtk_widget_set_halign(dl_lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(edit_deadline_box), dl_lbl, FALSE, FALSE, 0);
+    edit_cal_deadline = gtk_calendar_new();
+    gtk_box_pack_start(GTK_BOX(edit_deadline_box), edit_cal_deadline, FALSE, FALSE, 0);
+
+    /* Deadline time spinbuttons */
+    GtkWidget *dl_time_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *dl_time_lbl = gtk_label_new("Giờ hết hạn:");
+    gtk_box_pack_start(GTK_BOX(dl_time_box), dl_time_lbl, FALSE, FALSE, 0);
+    edit_dl_spin_hour   = gtk_spin_button_new_with_range(0, 23, 1);
+    edit_dl_spin_minute = gtk_spin_button_new_with_range(0, 59, 1);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(edit_dl_spin_hour),   TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(edit_dl_spin_minute), TRUE);
+    gtk_widget_set_size_request(edit_dl_spin_hour,   56, -1);
+    gtk_widget_set_size_request(edit_dl_spin_minute, 56, -1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(edit_dl_spin_hour),   23);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(edit_dl_spin_minute), 59);
+    gtk_box_pack_start(GTK_BOX(dl_time_box), edit_dl_spin_hour,          FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(dl_time_box), gtk_label_new(":"),         FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(dl_time_box), edit_dl_spin_minute,        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(edit_deadline_box), dl_time_box, FALSE, FALSE, 0);
+
+    gtk_widget_set_sensitive(edit_deadline_box, FALSE);
+    gtk_grid_attach(GTK_GRID(grid), edit_deadline_box, 0, 7, 4, 1);
+
+    /* Pre-fill deadline if exists */
+    if (t->deadline != 0) {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(edit_chk_deadline), TRUE);
+        gtk_widget_set_sensitive(edit_deadline_box, TRUE);
+        struct tm *dtm = localtime(&t->deadline);
+        gtk_calendar_select_month(GTK_CALENDAR(edit_cal_deadline), dtm->tm_mon, 1900 + dtm->tm_year);
+        gtk_calendar_select_day(GTK_CALENDAR(edit_cal_deadline), dtm->tm_mday);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(edit_dl_spin_hour),   dtm->tm_hour);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(edit_dl_spin_minute), dtm->tm_min);
+    }
+    g_signal_connect(edit_chk_deadline, "toggled", G_CALLBACK(on_deadline_toggle), edit_deadline_box);
+
+    /* Save button (moved after deadline) */
+    GtkWidget *save_btn2 = gtk_button_new_with_label("💾 Lưu thay đổi");
+    GtkStyleContext *sc_save2 = gtk_widget_get_style_context(save_btn2);
+    gtk_style_context_add_class(sc_save2, "btn-primary");
+    g_signal_connect(save_btn2, "clicked", G_CALLBACK(on_edit_save), NULL);
+    gtk_grid_attach(GTK_GRID(grid), save_btn2, 0, 8, 4, 1);
 
     gtk_widget_show_all(edit_dialog);
 }
@@ -247,10 +378,12 @@ static void refresh_task_list(void) {
         g_signal_connect(chk, "toggled", G_CALLBACK(on_toggle_done), NULL);
         gtk_box_pack_start(GTK_BOX(hbox), chk, FALSE, FALSE, 4);
 
-        /* Priority badge colour indicator */
+        /* Priority badge colour indicator — use EFFECTIVE priority for display */
+        DeadlineStatus ds = dl_status(t->deadline);
+        Priority eff_prio = dl_effective_priority(t->priority, ds);
         const char *prio_icon;
         const char *prio_tag_class;
-        switch (t->priority) {
+        switch (eff_prio) {
             case PRIORITY_HIGH:   prio_icon = "🔴"; prio_tag_class = "tag-high";   break;
             case PRIORITY_MEDIUM: prio_icon = "🟡"; prio_tag_class = "tag-medium"; break;
             default:              prio_icon = "🟢"; prio_tag_class = "tag-low";    break;
@@ -263,10 +396,10 @@ static void refresh_task_list(void) {
         char label_text[300];
         if (time_buf[0])
             snprintf(label_text, sizeof(label_text), "%s [%s]  %s  🕐 %s",
-                     prio_icon, priority_to_string(t->priority), t->title, time_buf);
+                     prio_icon, priority_to_string(eff_prio), t->title, time_buf);
         else
             snprintf(label_text, sizeof(label_text), "%s [%s]  %s",
-                     prio_icon, priority_to_string(t->priority), t->title);
+                     prio_icon, priority_to_string(eff_prio), t->title);
 
         GtkWidget *lbl = gtk_label_new(label_text);
         gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
@@ -280,10 +413,27 @@ static void refresh_task_list(void) {
         gtk_box_pack_start(GTK_BOX(hbox), lbl, TRUE, TRUE, 0);
 
         /* Priority tag pill */
-        GtkWidget *tag_lbl = gtk_label_new(priority_to_string(t->priority));
+        GtkWidget *tag_lbl = gtk_label_new(priority_to_string(eff_prio));
         GtkStyleContext *sc_tag = gtk_widget_get_style_context(tag_lbl);
         gtk_style_context_add_class(sc_tag, prio_tag_class);
         gtk_box_pack_start(GTK_BOX(hbox), tag_lbl, FALSE, FALSE, 0);
+
+        /* Deadline badge (show only if not done) */
+        if (!t->done && t->deadline != 0) {
+            char dl_buf[80];
+            format_deadline_label(t->deadline, dl_buf, sizeof(dl_buf));
+            GtkWidget *dl_lbl = gtk_label_new(dl_buf);
+            const char *dl_class;
+            switch (ds) {
+                case DEADLINE_OVERDUE: dl_class = "deadline-overdue"; break;
+                case DEADLINE_URGENT:  dl_class = "deadline-urgent";  break;
+                case DEADLINE_WARNING: dl_class = "deadline-warning"; break;
+                default:               dl_class = "deadline-normal";  break;
+            }
+            GtkStyleContext *sc_dl = gtk_widget_get_style_context(dl_lbl);
+            gtk_style_context_add_class(sc_dl, dl_class);
+            gtk_box_pack_start(GTK_BOX(hbox), dl_lbl, FALSE, FALSE, 4);
+        }
 
         /* Edit button */
         GtkWidget *edit_btn = gtk_button_new_with_label("✏");
@@ -364,6 +514,22 @@ static void on_add_task(GtkWidget *btn, gpointer data) {
     time_t start_time = mktime(&tm_val);
 
     tm_add(title, desc, (Priority)prio_idx, start_time);
+
+    /* Set deadline on the newly-added task */
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_deadline))) {
+        guint dy, dm, dd;
+        gtk_calendar_get_date(GTK_CALENDAR(cal_deadline), &dy, &dm, &dd);
+        struct tm dl_val = {0};
+        dl_val.tm_year  = (int)dy - 1900;
+        dl_val.tm_mon   = (int)dm;
+        dl_val.tm_mday  = (int)dd;
+        dl_val.tm_hour  = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spin_dl_hour));
+        dl_val.tm_min   = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spin_dl_minute));
+        dl_val.tm_sec   = 0;
+        dl_val.tm_isdst = -1;
+        tasks[task_count - 1].deadline = mktime(&dl_val);
+    }
+
     fm_save();
     gtk_entry_set_text(GTK_ENTRY(entry_title), "");
     gtk_entry_set_text(GTK_ENTRY(entry_desc),  "");
@@ -444,17 +610,49 @@ static GtkWidget *build_task_tab(void) {
     gtk_widget_set_valign(time_box, GTK_ALIGN_START);
     gtk_grid_attach(GTK_GRID(input_grid), time_box, 3, 3, 1, 1);
 
-    /* Row 4: Add button */
+    /* Row 4: Deadline toggle + calendar */
+    chk_deadline = gtk_check_button_new_with_label("⏳ Đặt deadline");
+    gtk_grid_attach(GTK_GRID(input_grid), chk_deadline, 0, 4, 2, 1);
+
+    deadline_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *lbl_dl = gtk_label_new("Ngày deadline:");
+    gtk_widget_set_halign(lbl_dl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(deadline_box), lbl_dl, FALSE, FALSE, 0);
+    cal_deadline = gtk_calendar_new();
+    gtk_box_pack_start(GTK_BOX(deadline_box), cal_deadline, FALSE, FALSE, 0);
+
+    /* Deadline time spinbuttons */
+    GtkWidget *dl_time_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *lbl_dl_time = gtk_label_new("Giờ hết hạn:");
+    gtk_box_pack_start(GTK_BOX(dl_time_row), lbl_dl_time, FALSE, FALSE, 0);
+    spin_dl_hour   = gtk_spin_button_new_with_range(0, 23, 1);
+    spin_dl_minute = gtk_spin_button_new_with_range(0, 59, 1);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(spin_dl_hour),   TRUE);
+    gtk_spin_button_set_wrap(GTK_SPIN_BUTTON(spin_dl_minute), TRUE);
+    gtk_widget_set_size_request(spin_dl_hour,   56, -1);
+    gtk_widget_set_size_request(spin_dl_minute, 56, -1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_dl_hour),   23);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_dl_minute), 59);
+    gtk_box_pack_start(GTK_BOX(dl_time_row), spin_dl_hour,          FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(dl_time_row), gtk_label_new(":"),    FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(dl_time_row), spin_dl_minute,        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(deadline_box), dl_time_row, FALSE, FALSE, 0);
+
+    gtk_widget_set_sensitive(deadline_box, FALSE);
+    gtk_grid_attach(GTK_GRID(input_grid), deadline_box, 2, 4, 2, 1);
+    g_signal_connect(chk_deadline, "toggled", G_CALLBACK(on_deadline_toggle), deadline_box);
+
+    /* Row 5: Add button */
     GtkWidget *add_btn = gtk_button_new_with_label("＋ Thêm công việc");
     GtkStyleContext *sc_add = gtk_widget_get_style_context(add_btn);
     gtk_style_context_add_class(sc_add, "btn-primary");
     g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_task), NULL);
-    gtk_grid_attach(GTK_GRID(input_grid), add_btn, 0, 4, 4, 1);
+    gtk_grid_attach(GTK_GRID(input_grid), add_btn, 0, 5, 4, 1);
 
     gtk_box_pack_start(GTK_BOX(vbox), input_frame, FALSE, FALSE, 0);
 
     /* ---------- Sort label hint ---------- */
-    GtkWidget *sort_hint = gtk_label_new("🔴 Cao  🟡 Trung bình  🟢 Thấp  —  Danh sách tự sắp xếp theo ưu tiên");
+    GtkWidget *sort_hint = gtk_label_new("🔴 Cao  🟡 Trung bình  🟢 Thấp  —  Deadline sắp tới sẽ tự động tăng ưu tiên");
     gtk_label_set_xalign(GTK_LABEL(sort_hint), 0.0f);
     GtkStyleContext *sc_hint = gtk_widget_get_style_context(sort_hint);
     gtk_style_context_add_class(sc_hint, "dim-label");
@@ -595,8 +793,39 @@ static int time_slot_of(int hour) {
     return 2;
 }
 
+/* Returns Monday 00:00:00 of the week containing t (or current week if t==0) */
+static time_t week_monday(time_t t) {
+    if (t == 0) t = time(NULL);
+    struct tm tm_copy = *localtime(&t);
+    int wd = tm_copy.tm_wday; /* 0=Sun */
+    int days_since_mon = (wd == 0) ? 6 : wd - 1;
+    tm_copy.tm_mday  -= days_since_mon;
+    tm_copy.tm_hour   = 0;
+    tm_copy.tm_min    = 0;
+    tm_copy.tm_sec    = 0;
+    tm_copy.tm_isdst  = -1;
+    return mktime(&tm_copy);
+}
+
 static void refresh_schedule(void) {
     if (!schedule_grid) return;
+
+    /* Initialise week_start to current week on first call */
+    if (schedule_week_start == 0)
+        schedule_week_start = week_monday(0);
+
+    /* Update week label */
+    if (schedule_week_label) {
+        time_t sun = schedule_week_start + 6 * 86400;
+        struct tm *ms = localtime(&schedule_week_start);
+        char buf_mon[16], buf_sun[16];
+        strftime(buf_mon, sizeof(buf_mon), "%d/%m", ms);
+        struct tm *ss = localtime(&sun);
+        strftime(buf_sun, sizeof(buf_sun), "%d/%m/%Y", ss);
+        char week_str[64];
+        snprintf(week_str, sizeof(week_str), "Tuần %s – %s", buf_mon, buf_sun);
+        gtk_label_set_text(GTK_LABEL(schedule_week_label), week_str);
+    }
 
     /* Remove all children except header row (row 0) and slot label col (col 0) */
     GList *children = gtk_container_get_children(GTK_CONTAINER(schedule_grid));
@@ -609,8 +838,50 @@ static void refresh_schedule(void) {
                                 NULL);
         if (row_idx > 0 && col_idx > 0)
             gtk_widget_destroy(w);
+        /* Also rebuild day headers (row 0, col 1..7) with dates */
+        if (row_idx == 0 && col_idx > 0)
+            gtk_widget_destroy(w);
     }
     g_list_free(children);
+
+    /* Re-build day headers with actual dates */
+    const char *day_names[] = { "Thứ Hai", "Thứ Ba", "Thứ Tư",
+                                 "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật" };
+    for (int d = 0; d < 7; d++) {
+        time_t day_t = schedule_week_start + d * 86400;
+        struct tm *dtm = localtime(&day_t);
+        char hdr_text[32];
+        snprintf(hdr_text, sizeof(hdr_text), "%s\n%02d/%02d",
+                 day_names[d], dtm->tm_mday, dtm->tm_mon + 1);
+
+        GtkWidget *hdr = gtk_label_new(hdr_text);
+        gtk_label_set_justify(GTK_LABEL(hdr), GTK_JUSTIFY_CENTER);
+        gtk_widget_set_margin_top(hdr, 6);
+        gtk_widget_set_margin_bottom(hdr, 6);
+        PangoAttrList *al = pango_attr_list_new();
+        pango_attr_list_insert(al, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(hdr), al);
+        pango_attr_list_unref(al);
+
+        /* Highlight today */
+        time_t now = time(NULL);
+        struct tm *ntm = localtime(&now);
+        if (dtm->tm_mday == ntm->tm_mday &&
+            dtm->tm_mon  == ntm->tm_mon  &&
+            dtm->tm_year == ntm->tm_year) {
+            GtkWidget *hdr_box = gtk_event_box_new();
+            gtk_container_add(GTK_CONTAINER(hdr_box), hdr);
+            GtkStyleContext *sc = gtk_widget_get_style_context(hdr_box);
+            gtk_style_context_add_class(sc, "schedule-header-today");
+            gtk_grid_attach(GTK_GRID(schedule_grid), hdr_box, d + 1, 0, 1, 1);
+        } else {
+            GtkWidget *hdr_box = gtk_event_box_new();
+            gtk_container_add(GTK_CONTAINER(hdr_box), hdr);
+            GtkStyleContext *sc = gtk_widget_get_style_context(hdr_box);
+            gtk_style_context_add_class(sc, "schedule-header");
+            gtk_grid_attach(GTK_GRID(schedule_grid), hdr_box, d + 1, 0, 1, 1);
+        }
+    }
 
     /*
      * Grid layout:
@@ -620,17 +891,20 @@ static void refresh_schedule(void) {
      *   rows 1,2,3     : Sáng, Chiều, Tối
      */
 
-    /* Build 7×3 vboxes */
+    /* Build 7×3 vboxes with background event boxes for alternating columns */
     GtkWidget *cell_boxes[8][3]; /* [day 1..7][slot 0..2] */
-    const char *slot_labels[] = { "🌅 Sáng", "☀ Chiều", "🌙 Tối" };
+    const char *slot_labels[] = { "🌅 Sáng\n(0–11h)", "☀ Chiều\n(12–17h)", "🌙 Tối\n(18–23h)" };
+    /* Alternating cell background classes */
+    const char *col_bg_class[] = { "sched-cell-odd", "sched-cell-even" };
 
     for (int s = 0; s < 3; s++) {
         /* Slot row label (col 0) */
         GtkWidget *slot_lbl = gtk_label_new(slot_labels[s]);
-        gtk_widget_set_margin_top(slot_lbl, 6);
-        gtk_widget_set_margin_bottom(slot_lbl, 6);
-        gtk_widget_set_margin_start(slot_lbl, 4);
-        gtk_widget_set_margin_end(slot_lbl, 4);
+        gtk_label_set_justify(GTK_LABEL(slot_lbl), GTK_JUSTIFY_CENTER);
+        gtk_widget_set_margin_top(slot_lbl, 8);
+        gtk_widget_set_margin_bottom(slot_lbl, 8);
+        gtk_widget_set_margin_start(slot_lbl, 6);
+        gtk_widget_set_margin_end(slot_lbl, 6);
         PangoAttrList *al = pango_attr_list_new();
         pango_attr_list_insert(al, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
         gtk_label_set_attributes(GTK_LABEL(slot_lbl), al);
@@ -642,39 +916,61 @@ static void refresh_schedule(void) {
         gtk_grid_attach(GTK_GRID(schedule_grid), slot_eb, 0, s + 1, 1, 1);
 
         for (int d = 1; d <= 7; d++) {
+            /* Outer event box for alternating column background */
+            GtkWidget *cell_eb = gtk_event_box_new();
+            GtkStyleContext *sc_cell = gtk_widget_get_style_context(cell_eb);
+            gtk_style_context_add_class(sc_cell, "sched-cell");
+            gtk_style_context_add_class(sc_cell, col_bg_class[(d - 1) % 2]);
+
             GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
             gtk_widget_set_margin_start(vb, 4);
             gtk_widget_set_margin_end(vb, 4);
-            gtk_widget_set_margin_top(vb, 4);
-            gtk_widget_set_margin_bottom(vb, 4);
+            gtk_widget_set_margin_top(vb, 6);
+            gtk_widget_set_margin_bottom(vb, 6);
+            gtk_container_add(GTK_CONTAINER(cell_eb), vb);
             cell_boxes[d][s] = vb;
-            gtk_grid_attach(GTK_GRID(schedule_grid), vb, d, s + 1, 1, 1);
+            gtk_grid_attach(GTK_GRID(schedule_grid), cell_eb, d, s + 1, 1, 1);
         }
     }
 
+    /* Place tasks that fall in the displayed week */
     for (int i = 0; i < task_count; i++) {
         Task *t = &tasks[i];
-        int wd   = weekday_of(t->start_time);
-        if (wd == 0) continue;
+        if (t->start_time == 0) continue;
 
-        int hour = hour_of(t->start_time);
-        int slot = time_slot_of(hour);
+        /* Check if task falls in displayed week */
+        time_t week_end = schedule_week_start + 7 * 86400;
+        if (t->start_time < schedule_week_start || t->start_time >= week_end) continue;
+
+        /* ISO weekday 1=Mon..7=Sun */
+        struct tm *ttm = localtime(&t->start_time);
+        int wd = (ttm->tm_wday == 0) ? 7 : ttm->tm_wday;
+
+        int slot = time_slot_of(ttm->tm_hour);
         if (slot < 0) continue;
 
         char time_buf[16];
         format_task_time(t->start_time, time_buf, sizeof(time_buf));
 
-        char card_text[180];
-        snprintf(card_text, sizeof(card_text), "%s\n%s", time_buf, t->title);
+        /* Build card text with optional deadline */
+        char card_text[220];
+        if (t->deadline != 0) {
+            char dl_buf[48];
+            format_deadline_label(t->deadline, dl_buf, sizeof(dl_buf));
+            snprintf(card_text, sizeof(card_text), "%s\n%s\n%s",
+                     time_buf, t->title, dl_buf);
+        } else {
+            snprintf(card_text, sizeof(card_text), "%s\n%s", time_buf, t->title);
+        }
 
         GtkWidget *card  = gtk_frame_new(NULL);
         GtkWidget *inner = gtk_label_new(card_text);
         gtk_label_set_xalign(GTK_LABEL(inner), 0.0f);
         gtk_label_set_line_wrap(GTK_LABEL(inner), TRUE);
-        gtk_widget_set_margin_start(inner, 4);
+        gtk_widget_set_margin_start(inner, 5);
         gtk_widget_set_margin_end(inner, 4);
-        gtk_widget_set_margin_top(inner, 2);
-        gtk_widget_set_margin_bottom(inner, 2);
+        gtk_widget_set_margin_top(inner, 3);
+        gtk_widget_set_margin_bottom(inner, 3);
 
         if (t->done) {
             PangoAttrList *attrs = pango_attr_list_new();
@@ -683,8 +979,11 @@ static void refresh_schedule(void) {
             pango_attr_list_unref(attrs);
         }
 
+        /* Use effective priority for card color */
+        DeadlineStatus ds = dl_status(t->deadline);
+        Priority eff = dl_effective_priority(t->priority, ds);
         const char *css_class;
-        switch (t->priority) {
+        switch (eff) {
             case PRIORITY_HIGH:   css_class = "task-high";   break;
             case PRIORITY_MEDIUM: css_class = "task-medium"; break;
             default:              css_class = "task-low";    break;
@@ -699,49 +998,89 @@ static void refresh_schedule(void) {
     gtk_widget_show_all(schedule_grid);
 }
 
+static void on_week_prev(GtkWidget *btn, gpointer data) {
+    (void)btn; (void)data;
+    schedule_week_start -= 7 * 86400;
+    refresh_schedule();
+}
+
+static void on_week_next(GtkWidget *btn, gpointer data) {
+    (void)btn; (void)data;
+    schedule_week_start += 7 * 86400;
+    refresh_schedule();
+}
+
+static void on_week_today(GtkWidget *btn, gpointer data) {
+    (void)btn; (void)data;
+    schedule_week_start = week_monday(0);
+    refresh_schedule();
+}
+
 static GtkWidget *build_schedule_tab(void) {
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
+    /* ---- Week navigation bar ---- */
+    GtkWidget *nav_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(nav_bar), 8);
+
+    GtkWidget *btn_prev = gtk_button_new_with_label("◀  Tuần trước");
+    GtkWidget *btn_today = gtk_button_new_with_label("📅 Hôm nay");
+    GtkWidget *btn_next = gtk_button_new_with_label("Tuần sau  ▶");
+
+    GtkStyleContext *sc_today = gtk_widget_get_style_context(btn_today);
+    gtk_style_context_add_class(sc_today, "btn-primary");
+
+    g_signal_connect(btn_prev,  "clicked", G_CALLBACK(on_week_prev),  NULL);
+    g_signal_connect(btn_today, "clicked", G_CALLBACK(on_week_today), NULL);
+    g_signal_connect(btn_next,  "clicked", G_CALLBACK(on_week_next),  NULL);
+
+    schedule_week_label = gtk_label_new("Tuần ...");
+    gtk_widget_set_hexpand(schedule_week_label, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(schedule_week_label), 0.5f);
+    PangoAttrList *wal = pango_attr_list_new();
+    pango_attr_list_insert(wal, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+    pango_attr_list_insert(wal, pango_attr_scale_new(1.1));
+    gtk_label_set_attributes(GTK_LABEL(schedule_week_label), wal);
+    pango_attr_list_unref(wal);
+
+    gtk_box_pack_start(GTK_BOX(nav_bar), btn_prev,            FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(nav_bar), btn_today,           FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(nav_bar), schedule_week_label, TRUE,  TRUE,  0);
+    gtk_box_pack_end  (GTK_BOX(nav_bar), btn_next,            FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(vbox), nav_bar, FALSE, FALSE, 0);
+
+    /* Thin separator below nav bar */
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(vbox), sep, FALSE, FALSE, 0);
+
+    /* ---- Scrollable grid ---- */
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
 
     schedule_grid = gtk_grid_new();
-    gtk_grid_set_column_homogeneous(GTK_GRID(schedule_grid), FALSE);
-    gtk_grid_set_row_spacing(GTK_GRID(schedule_grid), 1);
-    gtk_grid_set_column_spacing(GTK_GRID(schedule_grid), 1);
+    gtk_grid_set_column_homogeneous(GTK_GRID(schedule_grid), TRUE);
+    gtk_grid_set_row_spacing(GTK_GRID(schedule_grid), 2);
+    gtk_grid_set_column_spacing(GTK_GRID(schedule_grid), 2);
+    gtk_container_set_border_width(GTK_CONTAINER(schedule_grid), 8);
 
     /* Column 0 header: empty corner */
     GtkWidget *corner = gtk_label_new("");
     gtk_grid_attach(GTK_GRID(schedule_grid), corner, 0, 0, 1, 1);
 
-    /* Day header row (cols 1..7) */
-    const char *days[] = { "Thứ Hai", "Thứ Ba", "Thứ Tư",
-                            "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật" };
+    /* Day headers are rebuilt in refresh_schedule; add placeholders */
     for (int d = 0; d < 7; d++) {
-        GtkWidget *hdr = gtk_label_new(days[d]);
-        gtk_widget_set_margin_top(hdr, 8);
-        gtk_widget_set_margin_bottom(hdr, 8);
-
-        PangoAttrList *al = pango_attr_list_new();
-        pango_attr_list_insert(al, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(hdr), al);
-        pango_attr_list_unref(al);
-
-        GtkWidget *hdr_box = gtk_event_box_new();
-        gtk_container_add(GTK_CONTAINER(hdr_box), hdr);
-        GtkStyleContext *sc = gtk_widget_get_style_context(hdr_box);
-        gtk_style_context_add_class(sc, "schedule-header");
-
-        gtk_grid_attach(GTK_GRID(schedule_grid), hdr_box, d + 1, 0, 1, 1);
+        GtkWidget *ph = gtk_label_new("");
+        gtk_grid_attach(GTK_GRID(schedule_grid), ph, d + 1, 0, 1, 1);
     }
 
     gtk_container_add(GTK_CONTAINER(scroll), schedule_grid);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
 
-    GtkWidget *hint = gtk_label_new("Chỉ hiển thị công việc đã đặt ngày bắt đầu.  🌅 Sáng 0–11h  ☀ Chiều 12–17h  🌙 Tối 18–23h");
-    GtkStyleContext *sc = gtk_widget_get_style_context(hint);
-    gtk_style_context_add_class(sc, "dim-label");
+    GtkWidget *hint = gtk_label_new("🌅 Sáng 0–11h  ☀ Chiều 12–17h  🌙 Tối 18–23h  |  ⚠ Quá hạn  🔥 Gấp  ⏰ Sắp tới  📅 Bình thường  — Chỉ hiện task có ngày bắt đầu trong tuần này");
+    GtkStyleContext *sc_hint = gtk_widget_get_style_context(hint);
+    gtk_style_context_add_class(sc_hint, "dim-label");
     gtk_widget_set_margin_top(hint, 4);
     gtk_widget_set_margin_bottom(hint, 4);
     gtk_box_pack_start(GTK_BOX(vbox), hint, FALSE, FALSE, 0);
@@ -758,7 +1097,7 @@ static void load_css(void) {
     gtk_css_provider_load_from_data(provider,
 
     /* ── Global reset ── */
-    "* { outline: none; }\n"
+    "* { outline: none; color: #111111; }\n"
 
     /* ── Window background ── */
     "window, .background { background-color: #f5f5f3; }\n"
@@ -767,50 +1106,53 @@ static void load_css(void) {
     "notebook > header { background-color: #ffffff; border-bottom: 1px solid #e4e4e0; padding: 0; }\n"
     "notebook > header tab {"
     "   background-color: transparent; border: none; border-bottom: 2px solid transparent;"
-    "   color: #888; padding: 10px 20px; font-size: 13px; margin-bottom: -1px; }\n"
+    "   color: #444; padding: 10px 20px; font-size: 13px; margin-bottom: -1px; }\n"
     "notebook > header tab:checked {"
     "   color: #1a56db; border-bottom-color: #1a56db; font-weight: 500;"
     "   background-color: transparent; }\n"
-    "notebook > header tab:hover { color: #444; background-color: transparent; }\n"
+    "notebook > header tab:hover { color: #111; background-color: transparent; }\n"
     "notebook > stack { background-color: #f5f5f3; }\n"
 
     /* ── Frames / cards ── */
     "frame { border: 1px solid #e4e4e0; border-radius: 8px; background: #ffffff; }\n"
     "frame > border { border: none; }\n"
-    "frame > label { color: #888; font-size: 11px; font-weight: 500; padding: 0 6px; }\n"
+    "frame > label { color: #333; font-size: 11px; font-weight: 600; padding: 0 6px; }\n"
 
     /* ── Entries ── */
     "entry {"
     "   border: 1px solid #e0e0da; border-radius: 6px;"
-    "   background-color: #ffffff; color: #222; padding: 6px 10px; font-size: 13px; }\n"
+    "   background-color: #ffffff; color: #111; padding: 6px 10px; font-size: 13px; }\n"
     "entry:focus { border-color: #1a56db; box-shadow: none; }\n"
 
     /* ── Buttons ── */
     "button {"
-    "   border: 1px solid #e0e0da; border-radius: 6px;"
-    "   background-color: #ffffff; color: #333; padding: 6px 14px;"
+    "   border: 1px solid #d0d0c8; border-radius: 6px;"
+    "   background-color: #ffffff; color: #111; padding: 6px 14px;"
     "   font-size: 13px; box-shadow: none; text-shadow: none; }\n"
-    "button:hover { background-color: #f0f0ec; border-color: #c8c8c0; }\n"
+    "button:hover { background-color: #f0f0ec; border-color: #b0b0a8; }\n"
     "button:active { background-color: #e8e8e4; }\n"
+    "button label { color: #111; }\n"
 
     /* ── Primary action button (Add task) ── */
     ".btn-primary {"
     "   background-color: #1a56db; color: #ffffff;"
     "   border-color: #1a56db; font-weight: 500; }\n"
+    ".btn-primary label { color: #ffffff; }\n"
     ".btn-primary:hover { background-color: #1546b8; border-color: #1546b8; }\n"
     ".btn-primary:active { background-color: #1240a8; }\n"
 
     /* ── Icon-only small buttons (edit, delete) ── */
-    ".btn-icon { padding: 4px 8px; min-width: 0; border-radius: 5px; color: #888; }\n"
-    ".btn-icon:hover { color: #333; }\n"
+    ".btn-icon { padding: 4px 8px; min-width: 0; border-radius: 5px; color: #555; }\n"
+    ".btn-icon label { color: #555; }\n"
+    ".btn-icon:hover { color: #111; }\n"
     ".btn-delete:hover { color: #c0392b; border-color: #f5b7b1; background-color: #fdf2f1; }\n"
     ".btn-edit:hover   { color: #1a56db; border-color: #b0c8f8; background-color: #f0f4fd; }\n"
 
     /* ── Combo box ── */
-    "combobox button { border: 1px solid #e0e0da; border-radius: 6px; background-color: #fff; }\n"
+    "combobox button { border: 1px solid #d0d0c8; border-radius: 6px; background-color: #fff; color: #111; }\n"
 
     /* ── Spin buttons ── */
-    "spinbutton { border: 1px solid #e0e0da; border-radius: 6px; background: #fff; font-size: 13px; }\n"
+    "spinbutton { border: 1px solid #d0d0c8; border-radius: 6px; background: #fff; font-size: 13px; color: #111; }\n"
     "spinbutton:focus { border-color: #1a56db; }\n"
 
     /* ── ListBox (task list) ── */
@@ -821,43 +1163,69 @@ static void load_css(void) {
     "   border-radius: 7px;"
     "   margin: 3px 0;"
     "   padding: 2px; }\n"
-    "list row:hover { border-color: #c8c8c0; background-color: #fafafa; }\n"
+    "list row:hover { border-color: #c0c0b8; background-color: #fafafa; }\n"
     "list row:selected { background-color: #f0f4fd; border-color: #b0c8f8; }\n"
-    "list row:selected label { color: #222; }\n"
+    "list row:selected label { color: #111; }\n"
+    "list row label { color: #111; }\n"
 
     /* ── Scrolled window ── */
     "scrolledwindow { background-color: transparent; }\n"
     "scrolledwindow overshoot { background: none; }\n"
 
     /* ── Labels ── */
-    ".dim-label { color: #999; font-size: 12px; }\n"
-    ".section-label { color: #888; font-size: 11px; font-weight: 500; }\n"
+    "label { color: #111; }\n"
+    ".dim-label { color: #555; font-size: 12px; }\n"
+    ".section-label { color: #444; font-size: 11px; font-weight: 600; }\n"
 
     /* ── Priority tags in task list ── */
-    ".tag-high   { color: #a32d2d; background-color: #fcebeb; border-radius: 100px; padding: 1px 8px; font-size: 11px; }\n"
-    ".tag-medium { color: #854f0b; background-color: #faeeda; border-radius: 100px; padding: 1px 8px; font-size: 11px; }\n"
-    ".tag-low    { color: #3b6d11; background-color: #eaf3de; border-radius: 100px; padding: 1px 8px; font-size: 11px; }\n"
+    ".tag-high   { color: #7a1a1a; background-color: #fcebeb; border-radius: 100px; padding: 1px 8px; font-size: 11px; font-weight: 600; }\n"
+    ".tag-medium { color: #5a3200; background-color: #faeeda; border-radius: 100px; padding: 1px 8px; font-size: 11px; font-weight: 600; }\n"
+    ".tag-low    { color: #1e4a00; background-color: #eaf3de; border-radius: 100px; padding: 1px 8px; font-size: 11px; font-weight: 600; }\n"
 
     /* ── Calendar ── */
-    "calendar { border: 1px solid #e0e0da; border-radius: 8px; background: #fff; font-size: 13px; }\n"
+    "calendar { border: 1px solid #d0d0c8; border-radius: 8px; background: #fff; font-size: 13px; color: #111; }\n"
     "calendar:selected { background-color: #1a56db; color: white; border-radius: 4px; }\n"
+
+    /* ── Schedule navigation bar ── */
+    ".schedule-nav { background-color: #ffffff; border-bottom: 1px solid #e4e4e0; }\n"
+    ".schedule-nav label { color: #111; font-size: 14px; font-weight: 700; }\n"
 
     /* ── Schedule grid headers ── */
     ".schedule-header {"
-    "   background-color: #f0f0ec; color: #555;"
-    "   font-size: 11px; font-weight: 500; }\n"
+    "   background-color: #e8e8e2; color: #111;"
+    "   font-size: 12px; font-weight: 700; }\n"
+    ".schedule-header label { color: #111; font-weight: 700; }\n"
+    ".schedule-header-today {"
+    "   background-color: #d4e3fc; color: #0a3a8f;"
+    "   font-size: 12px; font-weight: 700; }\n"
+    ".schedule-header-today label { color: #0a3a8f; font-weight: 700; }\n"
     ".schedule-slot-header {"
-    "   background-color: #f8f8f5; color: #666;"
-    "   font-size: 11px; font-weight: 500; }\n"
+    "   background-color: #f0f0e8; color: #222;"
+    "   font-size: 11px; font-weight: 700; }\n"
+    ".schedule-slot-header label { color: #222; font-weight: 700; }\n"
+
+    /* ── Schedule grid cells ── */
+    ".sched-cell { border: 1px solid #dcdcd8; min-width: 110px; min-height: 80px; }\n"
+    ".sched-cell-odd  { background-color: #ffffff; }\n"
+    ".sched-cell-even { background-color: #f8f8f4; }\n"
+
+    /* ── Deadline badges ── */
+    ".deadline-overdue { color: #ffffff; background-color: #c0392b; border-radius: 100px; padding: 1px 7px; font-size: 11px; font-weight: 600; }\n"
+    ".deadline-urgent  { color: #ffffff; background-color: #d35400; border-radius: 100px; padding: 1px 7px; font-size: 11px; font-weight: 600; }\n"
+    ".deadline-warning { color: #4a2800; background-color: #faeeda; border-radius: 100px; padding: 1px 7px; font-size: 11px; font-weight: 600; }\n"
+    ".deadline-normal  { color: #1a3d00; background-color: #eaf3de; border-radius: 100px; padding: 1px 7px; font-size: 11px; }\n"
 
     /* ── Schedule task cards ── */
-    ".task-high   { border-left: 3px solid #e24b4a; background-color: #fff8f8; border-radius: 4px; }\n"
-    ".task-medium { border-left: 3px solid #ef9f27; background-color: #fffbf5; border-radius: 4px; }\n"
-    ".task-low    { border-left: 3px solid #639922; background-color: #f8fbf5; border-radius: 4px; }\n"
+    ".task-high   { border-left: 3px solid #c0392b; background-color: #fff5f5; border-radius: 4px; }\n"
+    ".task-high   label { color: #111; }\n"
+    ".task-medium { border-left: 3px solid #d35400; background-color: #fffbf2; border-radius: 4px; }\n"
+    ".task-medium label { color: #111; }\n"
+    ".task-low    { border-left: 3px solid #27ae60; background-color: #f5fbf5; border-radius: 4px; }\n"
+    ".task-low    label { color: #111; }\n"
 
     /* ── Pomodoro timer label (large) ── */
-    ".timer-display { font-size: 52px; font-weight: 500; color: #1a1a1a; letter-spacing: -2px; }\n"
-    ".mode-display  { font-size: 13px; font-weight: 500; color: #888; letter-spacing: 0.06em; }\n"
+    ".timer-display { font-size: 52px; font-weight: 500; color: #111111; letter-spacing: -2px; }\n"
+    ".mode-display  { font-size: 13px; font-weight: 600; color: #444; letter-spacing: 0.06em; }\n"
 
     , -1, NULL);
 

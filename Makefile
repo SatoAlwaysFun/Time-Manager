@@ -1,14 +1,31 @@
-CC     = gcc
-CFLAGS = -Iinclude $(shell pkg-config --cflags gtk+-3.0) -Wall -Wextra -std=c11
-LIBS   = $(shell pkg-config --libs gtk+-3.0)
+# ── Time Manager – MinGW / MSYS2 Makefile ──────────────────────────
+CC      = gcc
+TARGET  = TimeManager.exe
 
-SRC = main.c src/gui.c src/pomodoro.c src/task.c src/task_manager.c src/file_manager.c
-OUT = TimeManager.exe
+GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0)
+GTK_LIBS    := $(shell pkg-config --libs   gtk+-3.0)
 
-.PHONY: all clean
+CFLAGS  = -Wall -Wextra -std=c11 -Iinclude $(GTK_CFLAGS)
+LDFLAGS = $(GTK_LIBS) -mwindows
 
-all:
-	$(CC) $(SRC) $(CFLAGS) -o $(OUT) $(LIBS)
+SRCS    = main.c \
+          src/gui.c \
+          src/pomodoro.c \
+          src/sorttask.c \
+          src/task_manager.c \
+          src/file_manager.c
+
+OBJS    = $(SRCS:.c=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OUT)
+	del /Q $(subst /,\,$(OBJS)) $(TARGET) 2>nul || true
+
+.PHONY: all clean

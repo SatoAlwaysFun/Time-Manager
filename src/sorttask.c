@@ -1,4 +1,5 @@
 #include "task.h"
+#include <time.h>
 
 const char *priority_to_string(Priority p) {
     switch (p) {

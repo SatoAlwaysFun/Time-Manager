@@ -23,6 +23,7 @@ int tm_add(const char *title, const char *desc, Priority priority, time_t start_
     t->priority   = priority;
     t->done       = 0;
     t->start_time = start_time;
+    t->deadline   = 0;
     return t->id;
 }
 

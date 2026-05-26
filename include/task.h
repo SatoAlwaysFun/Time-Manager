@@ -19,7 +19,17 @@ typedef struct {
     Priority priority;
     int      done;          /* 0 = pending, 1 = done */
     time_t   start_time;    /* 0 = no time set */
+    time_t   deadline;      /* 0 = no deadline set */
 } Task;
+
+/* Deadline urgency levels */
+typedef enum {
+    DEADLINE_NONE    = 0,  /* no deadline */
+    DEADLINE_NORMAL  = 1,  /* > 3 days away */
+    DEADLINE_WARNING = 2,  /* <= 3 days away */
+    DEADLINE_URGENT  = 3,  /* <= 1 day away */
+    DEADLINE_OVERDUE = 4   /* past deadline */
+} DeadlineStatus;
 
 const char *priority_to_string(Priority p);
 

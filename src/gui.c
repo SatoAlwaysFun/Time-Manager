@@ -46,6 +46,8 @@ static GtkWidget *deadline_box    = NULL;   /* container to show/hide */
 
 /* Schedule tab */
 static GtkWidget *schedule_grid   = NULL;
+static GtkWidget *week_label      = NULL;  /* "Tuần N  DD/MM – DD/MM" */
+static int        week_offset     = 0;     /* 0=tuần này, -1=trước, +1=sau */
 
 /* Edit dialog globals */
 static int        edit_task_id    = -1;
@@ -65,6 +67,7 @@ static GtkWidget *edit_dialog         = NULL;
 /* Forward declarations */
 static void refresh_task_list(void);
 static void refresh_schedule(void);
+static void update_week_label(void);
 
 /* ================================================================
    Helpers
@@ -828,6 +831,64 @@ static GtkWidget *build_pomodoro_tab(void) {
    Build Schedule tab  – weekly timetable with Sáng/Chiều/Tối rows
    ================================================================ */
 
+/* Trả về time_t của 00:00 thứ Hai của tuần (week_offset=0 → tuần này) */
+static time_t get_week_monday(int offset) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    /* Lùi về thứ Hai */
+    int wday = (t->tm_wday == 0) ? 6 : t->tm_wday - 1;  /* 0=Mon..6=Sun */
+    t->tm_mday -= wday;
+    t->tm_mday += offset * 7;
+    t->tm_hour = 0; t->tm_min = 0; t->tm_sec = 0;
+    t->tm_isdst = -1;
+    return mktime(t);
+}
+
+static void update_week_label(void) {
+    if (!week_label) return;
+    time_t mon = get_week_monday(week_offset);
+    time_t sun = mon + 6 * 86400;
+    struct tm *tm_mon = localtime(&mon);
+    char buf_mon[16], buf_sun[16];
+    strftime(buf_mon, sizeof(buf_mon), "%d/%m", tm_mon);
+    struct tm *tm_sun = localtime(&sun);
+    strftime(buf_sun, sizeof(buf_sun), "%d/%m/%Y", tm_sun);
+
+    char label[64];
+    if (week_offset == 0)
+        snprintf(label, sizeof(label), "Tuần này  %s – %s", buf_mon, buf_sun);
+    else if (week_offset == -1)
+        snprintf(label, sizeof(label), "Tuần trước  %s – %s", buf_mon, buf_sun);
+    else if (week_offset == 1)
+        snprintf(label, sizeof(label), "Tuần sau  %s – %s", buf_mon, buf_sun);
+    else {
+        int wn = week_offset > 0 ? week_offset + 1 : -week_offset + 1;
+        snprintf(label, sizeof(label), "%s tuần  %s – %s",
+                 week_offset > 0 ? "+" : "-", buf_mon, buf_sun);
+        (void)wn;
+    }
+    gtk_label_set_text(GTK_LABEL(week_label), label);
+}
+
+static void on_week_prev(GtkWidget *w, gpointer d) {
+    (void)w; (void)d;
+    week_offset--;
+    update_week_label();
+    refresh_schedule();
+}
+static void on_week_next(GtkWidget *w, gpointer d) {
+    (void)w; (void)d;
+    week_offset++;
+    update_week_label();
+    refresh_schedule();
+}
+static void on_week_today(GtkWidget *w, gpointer d) {
+    (void)w; (void)d;
+    week_offset = 0;
+    update_week_label();
+    refresh_schedule();
+}
+
 /* Returns ISO weekday 1=Mon … 7=Sun for a time_t, or 0 if t==0 */
 static int weekday_of(time_t t) {
     if (t == 0) return 0;
@@ -853,7 +914,17 @@ static int time_slot_of(int hour) {
 static void refresh_schedule(void) {
     if (!schedule_grid) return;
 
-    /* Remove all children except header row (row 0) and slot label col (col 0) */
+    /* Tính thứ Hai và Chủ Nhật của tuần đang xem */
+    time_t week_mon = get_week_monday(week_offset);
+    time_t week_sun = week_mon + 6 * 86400 + 86399; /* hết 23:59:59 CN */
+
+    /* Hôm nay */
+    time_t now = time(NULL);
+    struct tm *tm_today = localtime(&now);
+    int today_yday = tm_today->tm_yday;
+    int today_year = tm_today->tm_year;
+
+    /* Xóa tất cả children trừ row 0 (header) và col 0 (slot labels) */
     GList *children = gtk_container_get_children(GTK_CONTAINER(schedule_grid));
     for (GList *l = children; l; l = l->next) {
         GtkWidget *w = GTK_WIDGET(l->data);
@@ -867,22 +938,61 @@ static void refresh_schedule(void) {
     }
     g_list_free(children);
 
-    /*
-     * Grid layout:
-     *   col 0          : row labels (Sáng/Chiều/Tối) – rows 1,2,3
-     *   col 1..7       : Mon..Sun
-     *   row 0          : day headers
-     *   rows 1,2,3     : Sáng, Chiều, Tối
-     */
+    /* Cũng xóa header ngày (row 0, col 1..7) để redraw với ngày mới */
+    children = gtk_container_get_children(GTK_CONTAINER(schedule_grid));
+    for (GList *l = children; l; l = l->next) {
+        GtkWidget *w = GTK_WIDGET(l->data);
+        gint row_idx, col_idx;
+        gtk_container_child_get(GTK_CONTAINER(schedule_grid), w,
+                                "top-attach",  &row_idx,
+                                "left-attach", &col_idx,
+                                NULL);
+        if (row_idx == 0 && col_idx >= 1)
+            gtk_widget_destroy(w);
+    }
+    g_list_free(children);
 
-    /* Build 7×3 vboxes with background event boxes for alternating columns */
-    GtkWidget *cell_boxes[8][3]; /* [day 1..7][slot 0..2] */
+    /* Vẽ lại header ngày với ngày cụ thể của tuần */
+    const char *day_names[] = { "Thứ Hai", "Thứ Ba", "Thứ Tư",
+                                 "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật" };
+    for (int d = 0; d < 7; d++) {
+        time_t day_t = week_mon + d * 86400;
+        struct tm *dtm = localtime(&day_t);
+        char date_str[8];
+        strftime(date_str, sizeof(date_str), "%d/%m", dtm);
+
+        char hdr_text[32];
+        snprintf(hdr_text, sizeof(hdr_text), "%s\n%s", day_names[d], date_str);
+
+        GtkWidget *hdr = gtk_label_new(hdr_text);
+        gtk_label_set_justify(GTK_LABEL(hdr), GTK_JUSTIFY_CENTER);
+        gtk_widget_set_margin_top(hdr, 6);
+        gtk_widget_set_margin_bottom(hdr, 6);
+
+        PangoAttrList *al = pango_attr_list_new();
+        pango_attr_list_insert(al, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        /* Highlight hôm nay */
+        int is_today = (dtm->tm_yday == today_yday && dtm->tm_year == today_year);
+        if (is_today)
+            pango_attr_list_insert(al, pango_attr_foreground_new(0x1565 * 257, 0xC0 * 257, 0x00));
+        gtk_label_set_attributes(GTK_LABEL(hdr), al);
+        pango_attr_list_unref(al);
+
+        GtkWidget *hdr_box = gtk_event_box_new();
+        gtk_container_add(GTK_CONTAINER(hdr_box), hdr);
+        GtkStyleContext *sc = gtk_widget_get_style_context(hdr_box);
+        gtk_style_context_add_class(sc, "schedule-header");
+        if (is_today)
+            gtk_style_context_add_class(sc, "schedule-header-today");
+        gtk_grid_attach(GTK_GRID(schedule_grid), hdr_box, d + 1, 0, 1, 1);
+    }
+
+    /* Build 7×3 cell boxes */
+    GtkWidget *cell_boxes[8][3];
     const char *slot_labels[] = { "🌅 Sáng\n(0–11h)", "☀ Chiều\n(12–17h)", "🌙 Tối\n(18–23h)" };
-    /* Alternating cell background classes */
     const char *col_bg_class[] = { "sched-cell-odd", "sched-cell-even" };
 
     for (int s = 0; s < 3; s++) {
-        /* Slot row label (col 0) */
         GtkWidget *slot_lbl = gtk_label_new(slot_labels[s]);
         gtk_label_set_justify(GTK_LABEL(slot_lbl), GTK_JUSTIFY_CENTER);
         gtk_widget_set_margin_top(slot_lbl, 8);
@@ -900,11 +1010,16 @@ static void refresh_schedule(void) {
         gtk_grid_attach(GTK_GRID(schedule_grid), slot_eb, 0, s + 1, 1, 1);
 
         for (int d = 1; d <= 7; d++) {
-            /* Outer event box for alternating column background */
             GtkWidget *cell_eb = gtk_event_box_new();
             GtkStyleContext *sc_cell = gtk_widget_get_style_context(cell_eb);
             gtk_style_context_add_class(sc_cell, "sched-cell");
             gtk_style_context_add_class(sc_cell, col_bg_class[(d - 1) % 2]);
+
+            /* Highlight cột ngày hôm nay */
+            time_t day_t = week_mon + (d - 1) * 86400;
+            struct tm *dtm = localtime(&day_t);
+            if (dtm->tm_yday == today_yday && dtm->tm_year == today_year)
+                gtk_style_context_add_class(sc_cell, "sched-cell-today");
 
             GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
             gtk_widget_set_margin_start(vb, 4);
@@ -917,11 +1032,15 @@ static void refresh_schedule(void) {
         }
     }
 
+    /* Điền tasks vào đúng ô của tuần đang xem */
     for (int i = 0; i < task_count; i++) {
         Task *t = &tasks[i];
-        int wd   = weekday_of(t->start_time);
-        if (wd == 0) continue;
+        if (t->start_time == 0) continue;
+        /* Lọc task thuộc tuần này */
+        if (t->start_time < week_mon || t->start_time > week_sun) continue;
 
+        int wd   = weekday_of(t->start_time);  /* 1=Mon..7=Sun */
+        if (wd == 0) continue;
         int hour = hour_of(t->start_time);
         int slot = time_slot_of(hour);
         if (slot < 0) continue;
@@ -929,7 +1048,6 @@ static void refresh_schedule(void) {
         char time_buf[16];
         format_task_time(t->start_time, time_buf, sizeof(time_buf));
 
-        /* Build card text with optional deadline */
         char card_text[220];
         if (t->deadline != 0) {
             char dl_buf[48];
@@ -956,7 +1074,6 @@ static void refresh_schedule(void) {
             pango_attr_list_unref(attrs);
         }
 
-        /* Use effective priority for card color */
         DeadlineStatus ds = dl_status(t->deadline);
         Priority eff = dl_effective_priority(t->priority, ds);
         const char *css_class;
@@ -978,6 +1095,44 @@ static void refresh_schedule(void) {
 static GtkWidget *build_schedule_tab(void) {
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
+    /* ── Thanh điều hướng tuần ── */
+    GtkWidget *nav_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(nav_bar, 8);
+    gtk_widget_set_margin_bottom(nav_bar, 6);
+    gtk_widget_set_margin_start(nav_bar, 12);
+    gtk_widget_set_margin_end(nav_bar, 12);
+
+    GtkWidget *btn_prev = gtk_button_new_with_label("◀  Tuần trước");
+    GtkWidget *btn_today = gtk_button_new_with_label("Hôm nay");
+    GtkWidget *btn_next = gtk_button_new_with_label("Tuần sau  ▶");
+
+    GtkStyleContext *sc_today = gtk_widget_get_style_context(btn_today);
+    gtk_style_context_add_class(sc_today, "btn-primary");
+
+    week_label = gtk_label_new("");
+    PangoAttrList *wl_al = pango_attr_list_new();
+    pango_attr_list_insert(wl_al, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+    pango_attr_list_insert(wl_al, pango_attr_scale_new(1.1));
+    gtk_label_set_attributes(GTK_LABEL(week_label), wl_al);
+    pango_attr_list_unref(wl_al);
+    gtk_widget_set_hexpand(week_label, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(week_label), 0.5f);
+
+    gtk_box_pack_start(GTK_BOX(nav_bar), btn_prev,   FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(nav_bar), btn_today,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(nav_bar), week_label, TRUE,  TRUE,  0);
+    gtk_box_pack_end  (GTK_BOX(nav_bar), btn_next,   FALSE, FALSE, 0);
+
+    g_signal_connect(btn_prev,  "clicked", G_CALLBACK(on_week_prev),  NULL);
+    g_signal_connect(btn_today, "clicked", G_CALLBACK(on_week_today), NULL);
+    g_signal_connect(btn_next,  "clicked", G_CALLBACK(on_week_next),  NULL);
+
+    gtk_box_pack_start(GTK_BOX(vbox), nav_bar, FALSE, FALSE, 0);
+
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(vbox), sep, FALSE, FALSE, 0);
+
+    /* ── Grid lịch ── */
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -988,41 +1143,22 @@ static GtkWidget *build_schedule_tab(void) {
     gtk_grid_set_column_spacing(GTK_GRID(schedule_grid), 2);
     gtk_container_set_border_width(GTK_CONTAINER(schedule_grid), 8);
 
-    /* Column 0 header: empty corner */
+    /* Corner cell (row 0, col 0) */
     GtkWidget *corner = gtk_label_new("");
     gtk_grid_attach(GTK_GRID(schedule_grid), corner, 0, 0, 1, 1);
-
-    /* Day header row (cols 1..7) */
-    const char *days[] = { "Thứ Hai", "Thứ Ba", "Thứ Tư",
-                            "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật" };
-    for (int d = 0; d < 7; d++) {
-        GtkWidget *hdr = gtk_label_new(days[d]);
-        gtk_widget_set_margin_top(hdr, 8);
-        gtk_widget_set_margin_bottom(hdr, 8);
-
-        PangoAttrList *al = pango_attr_list_new();
-        pango_attr_list_insert(al, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-        gtk_label_set_attributes(GTK_LABEL(hdr), al);
-        pango_attr_list_unref(al);
-
-        GtkWidget *hdr_box = gtk_event_box_new();
-        gtk_container_add(GTK_CONTAINER(hdr_box), hdr);
-        GtkStyleContext *sc = gtk_widget_get_style_context(hdr_box);
-        gtk_style_context_add_class(sc, "schedule-header");
-
-        gtk_grid_attach(GTK_GRID(schedule_grid), hdr_box, d + 1, 0, 1, 1);
-    }
 
     gtk_container_add(GTK_CONTAINER(scroll), schedule_grid);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
 
-    GtkWidget *hint = gtk_label_new("Chỉ hiển thị công việc đã đặt ngày bắt đầu.  🌅 Sáng 0–11h  ☀ Chiều 12–17h  🌙 Tối 18–23h  |  ⚠ Quá hạn  🔥 Gấp  ⏰ Sắp tới  📅 Bình thường");
-    GtkStyleContext *sc = gtk_widget_get_style_context(hint);
-    gtk_style_context_add_class(sc, "dim-label");
+    /* ── Hint bar ── */
+    GtkWidget *hint = gtk_label_new("🌅 Sáng 0–11h  ☀ Chiều 12–17h  🌙 Tối 18–23h     ⚠ Quá hạn  🔥 Gấp  ⏰ Sắp tới  📅 Bình thường     Chỉ hiện task có ngày bắt đầu");
+    GtkStyleContext *sc_hint = gtk_widget_get_style_context(hint);
+    gtk_style_context_add_class(sc_hint, "dim-label");
     gtk_widget_set_margin_top(hint, 4);
     gtk_widget_set_margin_bottom(hint, 4);
     gtk_box_pack_start(GTK_BOX(vbox), hint, FALSE, FALSE, 0);
 
+    update_week_label();
     refresh_schedule();
     return vbox;
 }
@@ -1132,6 +1268,9 @@ static void load_css(void) {
 
     /* ── Schedule grid cells ── */
     ".sched-cell { border: 1px solid #e0e0da; min-width: 110px; min-height: 80px; }\n"
+    ".sched-cell-today { background-color: #fffde7 !important; border: 2px solid #f9a825; }\n"
+    ".schedule-header-today { background-color: #1565c0; }\n"
+    ".schedule-header-today label { color: #ffffff; font-weight: 800; }\n"
     ".sched-cell-odd  { background-color: #ffffff; }\n"
     ".sched-cell-even { background-color: #fafaf8; }\n"
 
